@@ -17,7 +17,7 @@ class PoolPlanError(ValueError):
     """混样规划在业务上无解（目标不可达或最小解超过总份数上限），对应 HTTP 422。"""
 
 
-def _load_graph(conn: sqlite3.Connection) -> tuple[dict[int, str], Recipes]:
+def load_graph(conn: sqlite3.Connection) -> tuple[dict[int, str], Recipes]:
     """读取全部批次类型与配方，构成内存中的配方引用图。"""
     kinds = {row["id"]: row["kind"] for row in conn.execute("SELECT id, kind FROM batches")}
 
@@ -57,8 +57,53 @@ def batch_composition(conn: sqlite3.Connection, batch_id: int) -> Composition:
     - 同一原始样本经多条路径到达时，占比相加合并；
     - 新批次只能引用已创建的批次，引用关系天然是有向无环图，递归必然终止。
     """
-    kinds, recipes = _load_graph(conn)
+    kinds, recipes = load_graph(conn)
     return _expand(kinds, recipes, batch_id, {})
+
+
+def reachable_original_samples(
+    kinds: dict[int, str], recipes: Recipes, root_ids: list[int]
+) -> set[int]:
+    """沿配方图递归收集 root_ids 直接或间接可达的全部原始样本 id。
+
+    支持嵌套混样与多路径汇合：同一路径节点只展开一次。新批次只能引用已创建
+    的批次，引用图无环，DFS 必然终止。
+    """
+    samples: set[int] = set()
+    seen: set[int] = set()
+    stack = list(root_ids)
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if kinds.get(node) == "sample":
+            samples.add(node)
+        else:
+            stack.extend(ingredient_id for ingredient_id, _ in recipes.get(node, []))
+    return samples
+
+
+def find_exclusion_conflict(conn: sqlite3.Connection, sample_ids: set[int]) -> tuple[int, int] | None:
+    """在禁配规则中找出第一条命中样本集合的规则。
+
+    规则以 (sample_a_id, sample_b_id) 升序存储，按样本对字典序（先比第一
+    个 id，再比第二个）取第一条命中对；无命中时返回 None。
+    """
+    if len(sample_ids) < 2:
+        return None
+    # 规则量级通常很小，直接取全部规则在内存中过滤；ORDER BY 保证字典序
+    rows = conn.execute(
+        """
+        SELECT sample_a_id, sample_b_id
+        FROM exclusion_rules
+        ORDER BY sample_a_id, sample_b_id
+        """
+    ).fetchall()
+    for row in rows:
+        if row["sample_a_id"] in sample_ids and row["sample_b_id"] in sample_ids:
+            return row["sample_a_id"], row["sample_b_id"]
+    return None
 
 
 def downstream_batches(recipes: Recipes, batch_id: int) -> list[int]:
@@ -90,7 +135,7 @@ def recipe_preview(
     返回 {受影响批次 id: (原占比, 预演占比)}；新配方只允许引用比目标批次
     更早创建的批次（由调用方校验），替换后引用图仍是无环图，递归必然终止。
     """
-    kinds, recipes = _load_graph(conn)
+    kinds, recipes = load_graph(conn)
     affected = downstream_batches(recipes, batch_id)
 
     preview_recipes = dict(recipes)
@@ -126,7 +171,7 @@ def pool_plan(
 
     返回 (portions_a, portions_b, 新混样全部原始样本占比)。
     """
-    kinds, recipes = _load_graph(conn)
+    kinds, recipes = load_graph(conn)
     memo: dict[int, Composition] = {}
     comp_a = _expand(kinds, recipes, ingredient_a, memo)
     comp_b = _expand(kinds, recipes, ingredient_b, memo)

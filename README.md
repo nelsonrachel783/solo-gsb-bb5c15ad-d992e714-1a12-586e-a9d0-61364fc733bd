@@ -6,6 +6,7 @@
 
 - 登记**原始样本**、按配方创建**混样批次**（配方 = 已有批次 + 各自的正整数投入份数）
 - 创建校验：拒绝**空配方**（422）、**未知批次**（400）、**非正整数份数**（422，含 0、负数、小数、字符串）
+- **原始样本禁配规则**：登记一对不可混配的原始样本（无序对，重复登记不生成第二条）；创建混样时沿配方图递归展开（含嵌套混样与多路径汇合），一旦同时可达任一禁配对即返回 **409**，冲突样本对按 id 升序返回，**不创建批次或配方**；规则只约束随后创建的批次，不影响已有批次
 - 新批次只能引用**已创建**的批次，引用关系天然构成有向无环图，不可能成环
 - 占比追溯：按每层“投入份数 / 该层总份数”递归分摊；同一原始样本经多条路径到达时**自动合并**；基于 `fractions.Fraction` 精确有理数运算，返回**约分后**的分子与分母
 - **目标占比规划**：给定两个不同的已有批次、一个原始样本与目标占比，反算使新混样精确达标的**正整数投入份数**，只返回总份数最小的整数解（两原料占比都等于目标时取 1:1），配方可直接提交 `/pools`；**只规划、不创建批次**
@@ -45,8 +46,10 @@ docker compose up --build
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/samples` | 登记原始样本 |
-| `POST` | `/pools` | 创建混样批次 |
+| `POST` | `/pools` | 创建混样批次（命中禁配规则返回 409） |
 | `POST` | `/pool-plans` | 按目标占比反算整数份数配方（只规划，不写库） |
+| `POST` | `/exclusion-rules` | 登记原始样本禁配对（无序对，重复登记返回同一条） |
+| `GET` | `/exclusion-rules` | 列出禁配规则（按样本对字典序） |
 | `GET` | `/batches` | 列出全部批次 |
 | `GET` | `/batches/{id}` | 批次详情（混样含配方） |
 | `GET` | `/batches/{id}/composition` | 递归追溯原始样本占比 |
@@ -209,6 +212,56 @@ curl -X POST http://localhost:8000/pools \
 - 最小整数解的**总份数超过上限**时返回 **422**，错误信息中给出最小总份数与上限；恰好等于上限时正常返回；
 - 两原料 id 相同、分子 > 分母、分母 ≤ 0、份数上限非正整数等请求格式问题返回 **422**；引用不存在的批次返回 **400**；`sample_id` 指向混样批次（非原始样本）返回 **400**。
 
+### 7. 原始样本禁配规则
+
+`POST /exclusion-rules` 登记一对**不同且已存在的原始样本** id（`sample_a_id`、`sample_b_id`），声明二者不得出现在同一混样批次中。禁配对是**无序对**：服务端按 id 升序规范化存储，逆序或同序重复登记都不会生成第二条，而是返回 **200** 与已存在的同一条规则（首次登记返回 **201**）。
+
+```bash
+# 登记 S1 与 S3 禁配
+curl -X POST http://localhost:8000/exclusion-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 3}'
+```
+
+```json
+{
+  "id": 1,
+  "sample_a_id": 1,
+  "sample_b_id": 3,
+  "sample_a_name": "S1",
+  "sample_b_name": "S3",
+  "created_at": "2026-09-25T12:00:00.000Z"
+}
+```
+
+`GET /exclusion-rules` 列出全部规则，按样本对字典序（先比 `sample_a_id`，再比 `sample_b_id`）升序返回。
+
+创建混样时，服务端沿配方图**递归**收集新批次所有原料直接或间接可达的原始样本（覆盖嵌套混样与多路径汇合路径），若其中包含任一禁配对，则返回 **409**，并在 `conflicting_sample_ids` 中给出**按 id 升序的冲突样本对**：
+
+```bash
+# 设 P1 = 1×S1 + 1×S2、P2 = 1×S3 + 1×S4；新混样 = P1 + P2 同时可达 S1/S3
+curl -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "PBAD", "recipe": [{"batch_id": 5, "portions": 1}, {"batch_id": 6, "portions": 1}]}'
+# 409
+```
+
+```json
+{
+  "detail": {
+    "message": "混样命中原始样本禁配规则",
+    "conflicting_sample_ids": [1, 3]
+  }
+}
+```
+
+说明：
+
+- 冲突时**不创建批次、也不写入配方**：`/batches` 中不会出现该批次，其名称仍可用于后续请求；
+- 同时命中多条规则时，返回样本对**字典序最靠前**的一对；
+- 规则**只约束随后创建的批次**：登记规则不改动已有批次，其详情与 `/composition` 占比接口照常；但随后新建的批次只要沿已有配方**间接可达**该禁配对（如新批次引用了一个旧的、恰好混合二者的批次），同样会被拒绝；
+- 规则登记与混样创建在同一个 **SQLite IMMEDIATE 写事务**内完成校验与写入，写事务之间串行化，避免并发场景下“新规则刚生效、混样却漏检”或重复规则写入。
+
 ### 错误示例
 
 ```bash
@@ -239,6 +292,19 @@ curl -X POST http://localhost:8000/pool-plans -H 'Content-Type: application/json
 # 规划的最小整数解超过总份数上限（2/3 需要 2+1=3 份）→ 422
 curl -X POST http://localhost:8000/pool-plans -H 'Content-Type: application/json' \
   -d '{"ingredient_a_batch_id": 1, "ingredient_b_batch_id": 2, "sample_id": 1, "numerator": 2, "denominator": 3, "max_total_portions": 2}'
+
+# 新混样（含嵌套展开后可达的原始样本）命中禁配规则 → 409
+# {"detail":{"message":"混样命中原始样本禁配规则","conflicting_sample_ids":[1,3]}}
+curl -X POST http://localhost:8000/pools -H 'Content-Type: application/json' \
+  -d '{"name": "PBAD", "recipe": [{"batch_id": 5, "portions": 1}, {"batch_id": 6, "portions": 1}]}'
+
+# 禁配的两个样本必须不同 → 422
+curl -X POST http://localhost:8000/exclusion-rules -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 1}'
+
+# 禁配对象必须是已存在的原始样本：未知批次 → 400，混样批次 → 400
+curl -X POST http://localhost:8000/exclusion-rules -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 999}'
 ```
 
 ## 占比计算说明
@@ -262,12 +328,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（含目标占比规划、配方变更预演端点）
-  db.py         # SQLite 连接与建表（启动时自动执行）
+  main.py       # FastAPI 路由与请求处理（含目标占比规划、配方变更预演、禁配规则端点）
+  db.py         # SQLite 连接、建表与 IMMEDIATE 写事务（启动时自动执行）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算、目标占比反算与配方预演（Fraction 精确分数）
+  service.py    # 递归占比计算、可达样本/禁配冲突检测、目标占比反算与配方预演
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、禁配规则、各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

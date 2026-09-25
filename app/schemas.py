@@ -28,6 +28,28 @@ class PoolCreate(BaseModel):
     recipe: Annotated[list[RecipeItem], Field(min_length=1)]  # 拒绝空配方
 
 
+class ExclusionRuleCreate(BaseModel):
+    """登记一对不可混配的原始样本（无序对：服务端按 id 升序规范化）。"""
+
+    sample_a_id: StrictPositiveInt
+    sample_b_id: StrictPositiveInt
+
+    @model_validator(mode="after")
+    def _validate(self) -> ExclusionRuleCreate:
+        if self.sample_a_id == self.sample_b_id:
+            raise ValueError("禁配的两个原始样本必须不同")
+        return self
+
+
+class ExclusionRuleOut(BaseModel):
+    id: int
+    sample_a_id: int  # 无序对规范化后较小的样本 id
+    sample_b_id: int  # 无序对规范化后较大的样本 id
+    sample_a_name: str
+    sample_b_name: str
+    created_at: str
+
+
 class RecipeItemOut(BaseModel):
     batch_id: int
     batch_name: str

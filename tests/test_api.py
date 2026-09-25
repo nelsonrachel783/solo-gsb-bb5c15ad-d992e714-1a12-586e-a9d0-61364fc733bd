@@ -576,3 +576,198 @@ def test_pool_plan_sample_id_must_be_original_sample(client):
     r = plan(client, s1, p1, p1, 1, 2, 10)
     assert r.status_code == 400
     assert "原始样本" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 原始样本禁配规则：POST/GET /exclusion-rules 与 /pools 冲突检测
+# --------------------------------------------------------------------------- #
+
+
+def add_rule(client, a, b):
+    return client.post("/exclusion-rules", json={"sample_a_id": a, "sample_b_id": b})
+
+
+def test_exclusion_rule_register_and_list(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    r = add_rule(client, s1, s2)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    # 无序对按 id 升序存储与返回
+    assert body["sample_a_id"] == s1
+    assert body["sample_b_id"] == s2
+    assert body["sample_a_name"] == "S1"
+    assert body["sample_b_name"] == "S2"
+    assert body["id"] >= 1
+
+    rules = client.get("/exclusion-rules").json()
+    assert rules == [body]
+
+
+def test_exclusion_rule_reversed_order_is_same_pair(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    first = add_rule(client, s1, s2)
+    assert first.status_code == 201
+    rule_id = first.json()["id"]
+
+    # 逆序重复登记：返回已存在的同一条规则，200 且不生成第二条
+    r = add_rule(client, s2, s1)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == rule_id
+    assert r.json()["sample_a_id"] == s1
+    assert r.json()["sample_b_id"] == s2
+
+    # 同序重复同样不生成第二条
+    r = add_rule(client, s1, s2)
+    assert r.status_code == 200
+    assert r.json()["id"] == rule_id
+    assert len(client.get("/exclusion-rules").json()) == 1
+
+
+def test_exclusion_rules_listed_in_pair_lexicographic_order(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    s4 = make_sample(client, "S4")
+    # 乱序登记 (1,4)、(1,2)、(2,3)
+    add_rule(client, s1, s4)
+    add_rule(client, s1, s2)
+    add_rule(client, s2, s3)
+    pairs = [(r["sample_a_id"], r["sample_b_id"])
+             for r in client.get("/exclusion-rules").json()]
+    assert pairs == [(s1, s2), (s1, s4), (s2, s3)]
+
+
+def test_exclusion_rule_same_sample_rejected(client):
+    s1 = make_sample(client, "S1")
+    r = add_rule(client, s1, s1)
+    assert r.status_code == 422
+    assert "不同" in r.json()["detail"][0]["msg"]
+    assert client.get("/exclusion-rules").json() == []
+
+
+def test_exclusion_rule_unknown_or_non_sample_rejected(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+
+    r = add_rule(client, s1, 999)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+
+    r = add_rule(client, s1, p1)
+    assert r.status_code == 400
+    assert "原始样本" in r.json()["detail"]
+
+    assert client.get("/exclusion-rules").json() == []
+
+
+def test_pool_direct_exclusion_conflict_returns_409(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    add_rule(client, s1, s3)
+
+    r = client.post("/pools", json={"name": "BAD", "recipe": [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s3, "portions": 2},
+    ]})
+    assert r.status_code == 409
+    # 冲突样本对按 id 升序返回
+    detail = r.json()["detail"]
+    assert detail["conflicting_sample_ids"] == [s1, s3]
+
+    # 不创建批次或配方：没有名为 BAD 的批次，批次总数仍为 3
+    names = {b["name"] for b in client.get("/batches").json()}
+    assert "BAD" not in names
+    assert len(names) == 3
+    # 冲突导致的名字未被占用，仍可创建无冲突的同名批次
+    r = client.post("/pools", json={"name": "BAD", "recipe": [
+        {"batch_id": s2, "portions": 1}]})
+    assert r.status_code == 201
+
+
+def test_pool_nested_and_confluence_exclusion_conflict(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    s4 = make_sample(client, "S4")
+    s5 = make_sample(client, "S5")
+    # P1 = S1+S2、P2 = S3+S4，各自不含禁配对
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    p2 = make_pool(client, "P2", [
+        {"batch_id": s3, "portions": 1}, {"batch_id": s4, "portions": 1}])
+
+    add_rule(client, s1, s3)
+
+    # 嵌套汇合：新混样沿配方图可达 {S1,S2,S3,S4}，命中 (S1,S3)
+    r = client.post("/pools", json={"name": "BAD", "recipe": [
+        {"batch_id": p1, "portions": 1}, {"batch_id": p2, "portions": 1}]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicting_sample_ids"] == [s1, s3]
+
+    # 更深嵌套：P3 = P1+S5（{1,2,5} 不命中）成功；P4 = P3+P2 命中
+    p3 = make_pool(client, "P3", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s5, "portions": 1}])
+    r = client.post("/pools", json={"name": "BAD2", "recipe": [
+        {"batch_id": p3, "portions": 1}, {"batch_id": p2, "portions": 1}]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicting_sample_ids"] == [s1, s3]
+
+
+def test_pool_conflict_returns_lexicographically_first_pair(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    s4 = make_sample(client, "S4")
+    # 同时命中 (2,4) 与 (1,3)：字典序第一对是 (1,3)
+    add_rule(client, s2, s4)
+    add_rule(client, s1, s3)
+    r = client.post("/pools", json={"name": "BAD", "recipe": [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+        {"batch_id": s3, "portions": 1},
+        {"batch_id": s4, "portions": 1},
+    ]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicting_sample_ids"] == [s1, s3]
+
+    # 首元素相同的两对 (1,4)、(1,2)：取第二个 id 更小的 (1,2)
+    add_rule(client, s1, s4)
+    add_rule(client, s1, s2)
+    r = client.post("/pools", json={"name": "BAD2", "recipe": [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+        {"batch_id": s4, "portions": 1},
+    ]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicting_sample_ids"] == [s1, s2]
+
+
+def test_exclusion_rules_only_constrain_future_pools(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 规则登记前已存在的批次 P1 = S1+S2
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    before = fractions_of(client, p1)
+
+    add_rule(client, s1, s2)
+
+    # 已有批次不受影响，详情与占比接口照常
+    assert fractions_of(client, p1) == before
+    assert client.get(f"/batches/{p1}").status_code == 200
+
+    # 但随后创建的批次即使不直接混合 S1、S2，只要沿旧配方可达该禁配对就拒绝：
+    # 新混样 = S3 + P1，可达 {S1,S2,S3}，命中 (S1,S2)
+    r = client.post("/pools", json={"name": "BAD", "recipe": [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s3, "portions": 1}]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["conflicting_sample_ids"] == [s1, s2]
+
+    # 不含该对的新批次仍可创建
+    assert client.post("/pools", json={"name": "OK", "recipe": [
+        {"batch_id": s3, "portions": 1}]}).status_code == 201
