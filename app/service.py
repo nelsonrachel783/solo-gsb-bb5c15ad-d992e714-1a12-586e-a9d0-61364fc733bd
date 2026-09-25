@@ -50,6 +50,33 @@ def _expand(
     return result
 
 
+def reachable_samples(conn: sqlite3.Connection, ingredient_ids: list[int]) -> set[int]:
+    """沿配方图递归收集若干原料批次可达的全部原始样本 id。
+
+    包含嵌套混样与多路径汇合：只要某原始样本经任意路径可达即被收集。
+    配方图是有向无环图（新批次只能引用更早创建的批次），遍历必然终止。
+    份数不影响可达性，故此处只需图结构，不做分数运算。
+    """
+    kinds = {row["id"]: row["kind"] for row in conn.execute("SELECT id, kind FROM batches")}
+    recipes: dict[int, list[int]] = {}
+    for row in conn.execute("SELECT pool_id, ingredient_id FROM pool_recipes"):
+        recipes.setdefault(row["pool_id"], []).append(row["ingredient_id"])
+
+    samples: set[int] = set()
+    seen: set[int] = set()
+    stack = list(ingredient_ids)
+    while stack:
+        node = stack.pop()
+        if node in seen:  # 多路径汇合：同一批次只展开一次
+            continue
+        seen.add(node)
+        if kinds.get(node) == "sample":
+            samples.add(node)
+        else:
+            stack.extend(recipes.get(node, []))
+    return samples
+
+
 def batch_composition(conn: sqlite3.Connection, batch_id: int) -> Composition:
     """递归展开批次，返回 {原始样本 id: 占比}。
 

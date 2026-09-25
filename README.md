@@ -5,7 +5,8 @@
 ## 功能特性
 
 - 登记**原始样本**、按配方创建**混样批次**（配方 = 已有批次 + 各自的正整数投入份数）
-- 创建校验：拒绝**空配方**（422）、**未知批次**（400）、**非正整数份数**（422，含 0、负数、小数、字符串）
+- **原始样本禁配规则**：登记一对不同的原始样本（无序对，重复登记幂等）；创建混样时沿配方图递归展开**嵌套混样与多路径汇合**后的全部可达原始样本，命中任一禁配对即返回 **409**（不创建批次或配方）；规则只约束**随后创建**的批次，已有批次及其占比接口不受影响
+- 创建校验：拒绝**空配方**（422）、**未知批次**（400）、**非正整数份数**（422，含 0、负数、小数、字符串）、**命中禁配规则**（409）
 - 新批次只能引用**已创建**的批次，引用关系天然构成有向无环图，不可能成环
 - 占比追溯：按每层“投入份数 / 该层总份数”递归分摊；同一原始样本经多条路径到达时**自动合并**；基于 `fractions.Fraction` 精确有理数运算，返回**约分后**的分子与分母
 - **目标占比规划**：给定两个不同的已有批次、一个原始样本与目标占比，反算使新混样精确达标的**正整数投入份数**，只返回总份数最小的整数解（两原料占比都等于目标时取 1:1），配方可直接提交 `/pools`；**只规划、不创建批次**
@@ -45,7 +46,9 @@ docker compose up --build
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/samples` | 登记原始样本 |
-| `POST` | `/pools` | 创建混样批次 |
+| `POST` | `/exclusion-rules` | 登记原始样本禁配对（无序对，重复登记幂等） |
+| `GET` | `/exclusion-rules` | 列出全部禁配规则（按样本对字典序） |
+| `POST` | `/pools` | 创建混样批次（命中禁配返回 409） |
 | `POST` | `/pool-plans` | 按目标占比反算整数份数配方（只规划，不写库） |
 | `GET` | `/batches` | 列出全部批次 |
 | `GET` | `/batches/{id}` | 批次详情（混样含配方） |
@@ -209,6 +212,64 @@ curl -X POST http://localhost:8000/pools \
 - 最小整数解的**总份数超过上限**时返回 **422**，错误信息中给出最小总份数与上限；恰好等于上限时正常返回；
 - 两原料 id 相同、分子 > 分母、分母 ≤ 0、份数上限非正整数等请求格式问题返回 **422**；引用不存在的批次返回 **400**；`sample_id` 指向混样批次（非原始样本）返回 **400**。
 
+### 7. 原始样本禁配规则
+
+`POST /exclusion-rules` 登记一对**不同且已存在的原始样本** id（`sample_a_id`、`sample_b_id`）。禁配对是**无序对**：服务端按 id 归一为 `(low_sample_id, high_sample_id)` 存储并返回；请求中两个 id 的先后顺序无关。重复登记同一无序对（含交换顺序）**不会生成第二条规则**：首次返回 **201**，重复登记幂等返回 **200** 且 `created_at` 保持首次登记时间。两个 id 相同、引用不存在的批次或引用混样批次（非原始样本）返回 **400**。
+
+```bash
+curl -X POST http://localhost:8000/exclusion-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 2, "sample_b_id": 1}'
+# 201（参数顺序无关，响应按 id 升序归一）
+# {"low_sample_id":1,"high_sample_id":2,"created_at":"2026-09-25T09:00:00.000Z"}
+
+curl -X POST http://localhost:8000/exclusion-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 2}'
+# 200，重复登记幂等，不生成第二条
+```
+
+`GET /exclusion-rules` 列出全部规则，按样本对字典序（先 `low_sample_id` 后 `high_sample_id`）升序：
+
+```bash
+curl http://localhost:8000/exclusion-rules
+```
+
+```json
+[
+  {"low_sample_id": 1, "high_sample_id": 2, "created_at": "2026-09-25T09:00:00.000Z"}
+]
+```
+
+**创建混样时的禁配检查**：`POST /pools` 会沿配方图递归求新混样可达的**全部原始样本**——无论样本直接出现在配方中，还是经嵌套混样、多路径汇合间接可达——只要其中任意两个命中已登记的禁配对，即返回 **409**，且**不创建批次或配方**（失败的批次名称不会被占用）。响应 `detail.pair` 给出按 id 升序的冲突样本对；同时命中多条规则时，按样本对字典序返回**第一对**：
+
+```bash
+# P1 = S1 + S3（创建于规则登记之前的批次不受影响）
+# 登记禁配 (S1, S2) 后，尝试创建 P2 = 2×P1 + 3×S2：
+# P2 经 P1 嵌套可达 S1，与直接投入的 S2 构成禁配对
+curl -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "P2", "recipe": [{"batch_id": 3, "portions": 2}, {"batch_id": 2, "portions": 3}]}'
+```
+
+```json
+{
+  "detail": {
+    "message": "混样命中原始样本禁配规则",
+    "pair": [
+      {"sample_id": 1, "sample_name": "S1"},
+      {"sample_id": 2, "sample_name": "S2"}
+    ]
+  }
+}
+```
+
+说明：
+
+- 规则**只约束随后创建的批次**：登记之前已经存在的批次（即使本身同时含有这两个样本）不会被改动或删除，其详情与 `/batches/{id}/composition` 占比接口照常返回；随后创建的新批次若引用旧批次、经其可达样本构成禁配对，仍会被 409 拒绝；
+- `/pool-plans` 只做配方规划、不创建批次，`/batches/{id}/recipe-preview` 只做内存预演，二者均不做禁配检查；
+- 规则登记与混样创建使用同一个 SQLite 写事务模型（`BEGIN IMMEDIATE` 立即获取写锁），两类写操作相互串行：并发登记的规则一旦提交，随后的混样创建必然能读到该规则，不会漏检。
+
 ### 错误示例
 
 ```bash
@@ -239,6 +300,19 @@ curl -X POST http://localhost:8000/pool-plans -H 'Content-Type: application/json
 # 规划的最小整数解超过总份数上限（2/3 需要 2+1=3 份）→ 422
 curl -X POST http://localhost:8000/pool-plans -H 'Content-Type: application/json' \
   -d '{"ingredient_a_batch_id": 1, "ingredient_b_batch_id": 2, "sample_id": 1, "numerator": 2, "denominator": 3, "max_total_portions": 2}'
+
+# 登记禁配对时两个样本 id 相同 → 400
+curl -X POST http://localhost:8000/exclusion-rules -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 1}'
+
+# 登记禁配对引用不存在的批次 → 400 {"detail":"未知批次 id: [999]"}
+curl -X POST http://localhost:8000/exclusion-rules -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 999}'
+
+# 已登记禁配对 (1,2)，创建混样可达样本同时含 1 和 2（含经嵌套混样间接可达）→ 409
+curl -X POST http://localhost:8000/pools -H 'Content-Type: application/json' \
+  -d '{"name": "PBAD", "recipe": [{"batch_id": 1, "portions": 1}, {"batch_id": 2, "portions": 1}]}'
+# {"detail":{"message":"混样命中原始样本禁配规则","pair":[{"sample_id":1,"sample_name":"S1"},{"sample_id":2,"sample_name":"S2"}]}}
 ```
 
 ## 占比计算说明
@@ -262,12 +336,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（含目标占比规划、配方变更预演端点）
-  db.py         # SQLite 连接与建表（启动时自动执行）
+  main.py       # FastAPI 路由与请求处理（含禁配规则登记/查询、目标占比规划、配方变更预演端点）
+  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则表与写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算、目标占比反算与配方预演（Fraction 精确分数）
+  service.py    # 递归占比计算、配方图可达原始样本、目标占比反算与配方预演（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、禁配规则、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

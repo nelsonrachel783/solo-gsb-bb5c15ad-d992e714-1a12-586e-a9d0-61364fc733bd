@@ -1,4 +1,7 @@
 """API 端到端测试：每个用例使用独立的临时 SQLite 数据库。"""
+import threading
+from uuid import uuid4
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -576,3 +579,195 @@ def test_pool_plan_sample_id_must_be_original_sample(client):
     r = plan(client, s1, p1, p1, 1, 2, 10)
     assert r.status_code == 400
     assert "原始样本" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# POST/GET /exclusion-rules + /pools 禁配
+# --------------------------------------------------------------------------- #
+
+
+def add_rule(client, a, b):
+    return client.post("/exclusion-rules", json={"sample_a_id": a, "sample_b_id": b})
+
+
+def test_create_exclusion_rule_normalizes_order_and_lists(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 倒序登记，响应仍按 id 升序归一
+    r = add_rule(client, s2, s1)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["low_sample_id"] == s1
+    assert body["high_sample_id"] == s2
+    assert "created_at" in body
+
+    # 列表按 (low, high) 字典序
+    r = add_rule(client, s3, s1)
+    assert r.status_code == 201
+    rules = client.get("/exclusion-rules").json()
+    assert [(x["low_sample_id"], x["high_sample_id"]) for x in rules] == [
+        (s1, s2), (s1, s3),
+    ]
+
+
+def test_duplicate_unordered_pair_is_idempotent(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    first = add_rule(client, s1, s2)
+    assert first.status_code == 201
+    created_at = first.json()["created_at"]
+
+    # 同一无序对、交换顺序重复登记：不生成第二条，幂等返回 200 且 created_at 不变
+    r = add_rule(client, s2, s1)
+    assert r.status_code == 200, r.text
+    assert r.json() == first.json()
+    assert r.json()["created_at"] == created_at
+    rules = client.get("/exclusion-rules").json()
+    assert [(x["low_sample_id"], x["high_sample_id"]) for x in rules] == [(s1, s2)]
+
+
+def test_exclusion_rule_rejects_same_id_unknown_and_pool(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+
+    # 两个 id 相同 → 400
+    r = add_rule(client, s1, s1)
+    assert r.status_code == 400
+    assert "不同" in r.json()["detail"]
+    # 未知 id → 400
+    r = add_rule(client, s1, 999)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+    # 混样批次不是原始样本 → 400
+    r = add_rule(client, s1, p1)
+    assert r.status_code == 400
+    assert str(p1) in r.json()["detail"]
+    assert client.get("/exclusion-rules").json() == []
+
+
+def test_pool_hitting_direct_pair_returns_409_and_creates_nothing(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    assert add_rule(client, s1, s2).status_code == 201
+
+    before = client.get("/batches").json()
+    r = client.post("/pools", json={"name": "PBAD", "recipe": [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}]})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["pair"] == [
+        {"sample_id": s1, "sample_name": "S1"},
+        {"sample_id": s2, "sample_name": "S2"},
+    ]
+    # 不创建批次（名称也未占用）或配方
+    assert client.get("/batches").json() == before
+    assert client.post("/pools", json={"name": "PBAD", "recipe": [
+        {"batch_id": s1, "portions": 1}]}).status_code == 201
+
+
+def test_pool_conflict_through_nested_and_merged_paths(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 无冲突的中间混样：P1 = S1 + S3
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s3, "portions": 1}])
+    assert add_rule(client, s1, s2).status_code == 201
+
+    # 嵌套命中：P2 直接只引用 P1 与 S2，但经 P1 可达 S1 → 禁配
+    r = client.post("/pools", json={"name": "P2", "recipe": [
+        {"batch_id": p1, "portions": 2}, {"batch_id": s2, "portions": 3}]})
+    assert r.status_code == 409
+    assert [p["sample_id"] for p in r.json()["detail"]["pair"]] == [s1, s2]
+
+
+def test_multiple_hits_return_lexicographically_first_pair(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    s4 = make_sample(client, "S4")
+    # 同一混样将命中 (s1,s4) 与 (s2,s3) 两条规则，字典序第一为 (s1,s4)
+    assert add_rule(client, s2, s3).status_code == 201
+    assert add_rule(client, s1, s4).status_code == 201
+    r = client.post("/pools", json={"name": "PX", "recipe": [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+        {"batch_id": s3, "portions": 1},
+        {"batch_id": s4, "portions": 1},
+    ]})
+    assert r.status_code == 409
+    assert [p["sample_id"] for p in r.json()["detail"]["pair"]] == [s1, s4]
+
+
+def test_rules_only_constrain_future_pools(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 规则登记前已创建的混样保留不动，占比接口照常工作
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    assert add_rule(client, s1, s2).status_code == 201
+    assert fractions_of(client, p1) == {s1: (1, 2), s2: (1, 2)}
+    assert client.get(f"/batches/{p1}").status_code == 200
+    # 规则只约束随后创建的批次：即使引用旧批次 P1，只要新批次可达的样本不触禁即可
+    p_s1 = make_pool(client, "Q1", [{"batch_id": s1, "portions": 1}])
+    p_s3 = make_pool(client, "Q3", [{"batch_id": s3, "portions": 1}])
+    assert client.post("/pools", json={"name": "P2", "recipe": [
+        {"batch_id": p_s1, "portions": 1}, {"batch_id": s3, "portions": 1}]}).status_code == 201
+    # 但新批次经旧批次 P1 同时可达 S1、S2 时，仍按规则拒绝
+    r = client.post("/pools", json={"name": "P3", "recipe": [
+        {"batch_id": p1, "portions": 1}, {"batch_id": p_s3, "portions": 1}]})
+    assert r.status_code == 409
+    assert [p["sample_id"] for p in r.json()["detail"]["pair"]] == [s1, s2]
+
+
+def test_concurrent_rule_registration_and_pool_creation(client):
+    # 并发登记规则与创建混样：结果只能是“规则先到→409，批次不存在”
+    # 或“批次先到→201”，不允许出现规则已生效却漏检（201 且规则存在）
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    barrier = threading.Barrier(4)
+    lock = threading.Lock()
+    pool_codes: list[int] = []
+    rule_code: dict[str, int] = {}
+
+    def register():
+        barrier.wait()
+        r = add_rule(client, s1, s2)
+        rule_code["status"] = r.status_code
+
+    def create(idx):
+        barrier.wait()
+        r = client.post("/pools", json={
+            "name": f"CP{idx}-{uuid4()}",
+            "recipe": [
+                {"batch_id": s1, "portions": 1},
+                {"batch_id": s2, "portions": 1},
+            ],
+        })
+        with lock:  # 按实际完成时间记录
+            pool_codes.append(r.status_code)
+
+    threads = [threading.Thread(target=register),
+               threading.Thread(target=create, args=(1,)),
+               threading.Thread(target=create, args=(2,)),
+               threading.Thread(target=create, args=(3,))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert rule_code["status"] in (200, 201)
+    assert set(pool_codes) <= {201, 409}, pool_codes
+    assert len(pool_codes) == 3
+    # 最终规则一定存在；以写事务串行后，结果只能呈“若干 201 后全为 409”
+    # 的单调形态——规则提交后不允许再漏检创建成功
+    rules = client.get("/exclusion-rules").json()
+    assert [(r["low_sample_id"], r["high_sample_id"]) for r in rules] == [(s1, s2)]
+    first_reject = next((i for i, c in enumerate(pool_codes) if c == 409), None)
+    if first_reject is not None:
+        assert all(c == 409 for c in pool_codes[first_reject:])
+

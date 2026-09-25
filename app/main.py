@@ -1,7 +1,9 @@
 """实验室混样批次追溯 API。
 
 - POST /samples                        登记原始样本
-- POST /pools                          创建混样批次（引用已有批次 + 正整数份数）
+- POST /exclusion-rules                登记原始样本禁配对（无序对，重复登记幂等）
+- GET  /exclusion-rules                列出全部禁配规则
+- POST /pools                          创建混样批次（引用已有批次 + 正整数份数，命中禁配返回 409）
 - POST /pool-plans                     按目标占比反算整数份数配方（只规划，不创建批次）
 - GET  /batches                        列出全部批次
 - GET  /batches/{batch_id}             批次详情（混样含配方）
@@ -15,7 +17,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from fractions import Fraction
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 
 from . import db
 from .schemas import (
@@ -23,6 +25,8 @@ from .schemas import (
     BatchOut,
     ComponentOut,
     CompositionOut,
+    ExclusionRuleCreate,
+    ExclusionRuleOut,
     FractionOut,
     PoolCreate,
     PoolPlanOut,
@@ -34,7 +38,13 @@ from .schemas import (
     RecipePreviewRequest,
     SampleCreate,
 )
-from .service import PoolPlanError, batch_composition, pool_plan, recipe_preview
+from .service import (
+    PoolPlanError,
+    batch_composition,
+    pool_plan,
+    reachable_samples,
+    recipe_preview,
+)
 
 
 @asynccontextmanager
@@ -115,6 +125,108 @@ def create_sample(payload: SampleCreate, conn: sqlite3.Connection = Depends(get_
     return _batch_out(conn, _fetch_batch(conn, cur.lastrowid))
 
 
+@app.get(
+    "/exclusion-rules",
+    response_model=list[ExclusionRuleOut],
+    summary="列出全部原始样本禁配规则",
+)
+def list_exclusion_rules(conn: sqlite3.Connection = Depends(get_db)) -> list[ExclusionRuleOut]:
+    rows = conn.execute(
+        """
+        SELECT low_sample_id, high_sample_id, created_at
+        FROM exclusion_rules
+        ORDER BY low_sample_id, high_sample_id
+        """
+    ).fetchall()
+    return [
+        ExclusionRuleOut(
+            low_sample_id=r["low_sample_id"],
+            high_sample_id=r["high_sample_id"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+@app.post(
+    "/exclusion-rules",
+    response_model=ExclusionRuleOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="登记原始样本禁配对",
+)
+def create_exclusion_rule(
+    payload: ExclusionRuleCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ExclusionRuleOut:
+    low_id, high_id = sorted((payload.sample_a_id, payload.sample_b_id))
+    if low_id == high_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="两个原始样本 id 必须不同")
+
+    placeholders = ", ".join("?" for _ in (low_id, high_id))
+    rows = {
+        r["id"]: r
+        for r in conn.execute(
+            f"SELECT id, kind FROM batches WHERE id IN ({placeholders})", (low_id, high_id)
+        )
+    }
+    missing = [i for i in (low_id, high_id) if i not in rows]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+    not_samples = [
+        i for i in (low_id, high_id) if rows[i]["kind"] != "sample"
+    ]
+    if not_samples:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"禁配对象必须是原始样本（kind='sample'）: {not_samples}",
+        )
+
+    # 与混样创建共用写事务（BEGIN IMMEDIATE 立即获取写锁）：
+    # 规则登记与 /pools 的禁配检查相互串行，不会出现新规则提交后漏检
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            "SELECT created_at FROM exclusion_rules WHERE low_sample_id = ? AND high_sample_id = ?",
+            (low_id, high_id),
+        ).fetchone()
+        if existing is not None:
+            # 同一无序对重复登记：不生成第二条规则，幂等返回 200
+            conn.rollback()
+            response.status_code = status.HTTP_200_OK
+            return ExclusionRuleOut(
+                low_sample_id=low_id,
+                high_sample_id=high_id,
+                created_at=existing["created_at"],
+            )
+        cur = conn.execute(
+            "INSERT INTO exclusion_rules (low_sample_id, high_sample_id) VALUES (?, ?)",
+            (low_id, high_id),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # 并发下另一事务抢先登记同一对：与重复登记同等处理
+        conn.rollback()
+        row = conn.execute(
+            "SELECT created_at FROM exclusion_rules WHERE low_sample_id = ? AND high_sample_id = ?",
+            (low_id, high_id),
+        ).fetchone()
+        response.status_code = status.HTTP_200_OK
+        return ExclusionRuleOut(
+            low_sample_id=low_id,
+            high_sample_id=high_id,
+            created_at=row["created_at"],
+        )
+    row = conn.execute(
+        "SELECT created_at FROM exclusion_rules WHERE rowid = ?", (cur.lastrowid,)
+    ).fetchone()
+    return ExclusionRuleOut(
+        low_sample_id=low_id,
+        high_sample_id=high_id,
+        created_at=row["created_at"],
+    )
+
+
 @app.post(
     "/pools",
     response_model=BatchOut,
@@ -139,7 +251,43 @@ def create_pool(payload: PoolCreate, conn: sqlite3.Connection = Depends(get_db))
             status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}"
         )
 
+    # 立即获取写锁后再做禁配检查与插入：并发登记的禁配规则若已提交，
+    # 必然在本事务的快照中可见（或其写锁迫使本事务等待其提交），不会漏检
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        # 沿配方图递归求新混样可达的全部原始样本（含嵌套混样与汇合路径）
+        sample_ids = reachable_samples(conn, ids)
+        conflicting = conn.execute(
+            f"""
+            SELECT low_sample_id, high_sample_id
+            FROM exclusion_rules
+            WHERE low_sample_id IN ({", ".join("?" for _ in sample_ids)})
+              AND high_sample_id IN ({", ".join("?" for _ in sample_ids)})
+            ORDER BY low_sample_id, high_sample_id
+            LIMIT 1
+            """,
+            (*sorted(sample_ids), *sorted(sample_ids)),
+        ).fetchone() if sample_ids else None
+        if conflicting is not None:
+            conn.rollback()
+            low_id, high_id = conflicting["low_sample_id"], conflicting["high_sample_id"]
+            names = {
+                r["id"]: r["name"]
+                for r in conn.execute(
+                    "SELECT id, name FROM batches WHERE id IN (?, ?)", (low_id, high_id)
+                )
+            }
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "混样命中原始样本禁配规则",
+                    "pair": [
+                        {"sample_id": low_id, "sample_name": names[low_id]},
+                        {"sample_id": high_id, "sample_name": names[high_id]},
+                    ],
+                },
+            )
+
         cur = conn.execute(
             "INSERT INTO batches (name, kind) VALUES (?, 'pool')", (payload.name,)
         )
@@ -149,6 +297,8 @@ def create_pool(payload: PoolCreate, conn: sqlite3.Connection = Depends(get_db))
             [(pool_id, i, merged[i]) for i in ids],
         )
         conn.commit()
+    except HTTPException:
+        raise
     except sqlite3.IntegrityError:
         conn.rollback()
         raise HTTPException(

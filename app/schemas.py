@@ -18,6 +18,20 @@ class SampleCreate(BaseModel):
     name: BatchName
 
 
+class ExclusionRuleCreate(BaseModel):
+    """登记一对不同的原始样本禁配对；顺序无关，服务端按 id 归一化。"""
+
+    sample_a_id: StrictPositiveInt
+    sample_b_id: StrictPositiveInt
+
+
+class ExclusionRuleOut(BaseModel):
+    # 无序对归一后按 id 升序返回
+    low_sample_id: int
+    high_sample_id: int
+    created_at: str
+
+
 class RecipeItem(BaseModel):
     batch_id: StrictPositiveInt
     portions: StrictPositiveInt
